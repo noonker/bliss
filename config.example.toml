@@ -1,0 +1,38 @@
+# ~/.config/bliss/config.toml  (or point BLISS_CONFIG at a file)
+
+[targets.local]
+type = "podman"                 # or "docker"
+# command = ["podman", "--remote", "--connection", "gpu-box"]
+# run_args = ["--device", "nvidia.com/gpu=all"]
+
+[targets.box]
+type = "ssh"
+host = "me@server.example.com"  # anything ssh accepts, including ~/.ssh/config names
+session = "tmux"                # or "screen"; must be installed on the server
+
+[targets.cluster]
+type = "kubernetes"
+kind = "pod"                    # or "deployment"
+registry = "registry.example.com/me"   # required: the cluster pulls from here
+# context = "admin@cluster"
+# namespace = "default"
+# image_pull_secret = "regcred"
+# push_args = ["--tls-verify=false"]
+# builder = ["podman"]
+# resources = { limits = { memory = "2Gi" } }
+
+[env]
+# The whole environment travels except session variables (DISPLAY, SSH_AUTH_SOCK...).
+# Use `bliss run -n` to see the names that would be sent.
+exclude = ["AWS_*", "*_PASSWORD"]
+# include = ["DISPLAY"]         # wins over the built-in and `exclude` lists
+
+[ai]
+agent = "claude"                # or "autolith", "hermes", "pi"
+unattended = false              # true: agents act without approval prompts
+
+# Each agent can be pinned or have its commands changed. A "{prompt}" element
+# is replaced with the prompt as one argument, and only as a whole element.
+[agents.claude]
+# version = "2.1.317"
+# prompt = ["claude", "-p", "{prompt}", "--model", "opus"]

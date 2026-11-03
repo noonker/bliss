@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bliss"
+version = "0.1.0"
+description = "Send the current directory, env and Guix/Nix shell to podman, a remote tmux/screen session, or Kubernetes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+bliss = "bliss.cli:main"
+
+[tool.setuptools]
+packages = ["bliss", "bliss.targets"]
