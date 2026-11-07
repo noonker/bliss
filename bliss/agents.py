@@ -69,7 +69,7 @@ BUILTIN: dict[str, Agent] = {
         # is sandboxed. An ssh target is a real machine, so it never gets this.
         sandbox_env=(("IS_SANDBOX", "1"),),
         config_env="CLAUDE_CONFIG_DIR",
-        guix_deps=("git", "ripgrep"),
+        guix_deps=("git-minimal", "ripgrep"),
         nix_deps=("git", "ripgrep"),
     ),
     "autolith": Agent(
