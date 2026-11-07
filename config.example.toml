@@ -28,6 +28,10 @@ registry = "registry.example.com/me"   # required: the cluster pulls from here
 # builder = ["podman"]
 # resources = { limits = { memory = "2Gi" } }
 
+# By default bliss refuses to send a directory that is not inside a git repository.
+# Set this to true to allow sending any directory without that check.
+# allow_untracked_dir = true
+
 [env]
 # The whole environment travels except session variables (DISPLAY, SSH_AUTH_SOCK...).
 # Use `bliss run -n` to see the names that would be sent.

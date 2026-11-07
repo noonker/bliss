@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", "-n", action="store_true", help="show the plan; send nothing")
     run.add_argument("--json", action="store_true",
                      help="print the started workload as JSON, for other tools")
+    run.add_argument("--allow-untracked", action="store_true",
+                     help="send even if the directory is not inside a git repository")
     run.add_argument("command", nargs=argparse.REMAINDER, help="command (after --)")
 
     ai = actions.add_parser("ai", help="run an AI agent on the target")
@@ -47,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print the started workload as JSON, for other tools")
     ai.add_argument("--unattended", action="store_true", default=None,
                     help="let the agent act without approval prompts")
+    ai.add_argument("--allow-untracked", action="store_true",
+                    help="send even if the directory is not inside a git repository")
     ai.add_argument("prompt", nargs="*", help="task; omit for an interactive session")
 
     which = ("workload name, or the start of either word: 'ott' for sunny-otter "
@@ -86,6 +91,19 @@ def _is_in_place(target_spec: dict) -> bool:
     return target_spec["type"] == "here"
 
 
+def _assert_git_tracked(root: Path) -> None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise BlissError(
+            f"{root} is not inside a git repository; bliss refuses to send untracked "
+            "directories by default (use --allow-untracked or set "
+            "allow_untracked_dir = true in your config to override)"
+        )
+
+
 def _print_targets(config: cfg.Config) -> None:
     default = cfg.get_default_target()
     if not config.targets:
@@ -119,6 +137,10 @@ def _launch(args, config: cfg.Config, command: list[str], spec: AgentSpec | None
     if spec and not in_place and platform.machine() != "x86_64":
         raise BlissError(f"AI agents are only packed for x86_64, not {platform.machine()}")
     root = Path.cwd()
+    if not in_place:
+        allow = getattr(args, "allow_untracked", False) or config.allow_untracked_dir
+        if not allow:
+            _assert_git_tracked(root)
     if in_place:
         system = None
         env = here_env(dict(os.environ))

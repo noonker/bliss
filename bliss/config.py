@@ -28,6 +28,7 @@ class Config:
     ai: dict
     agents: dict[str, dict]
     path: Path
+    allow_untracked_dir: bool = False
 
     def target(self, name: str) -> dict:
         if name not in self.targets:
@@ -59,7 +60,8 @@ def load_config(path: Path | None = None) -> Config:
         if kind == "kubernetes" and spec.get("kind", "pod") not in ("pod", "deployment"):
             raise BlissError(f"target '{name}': kind must be pod or deployment")
     return Config(targets=targets, env=data.get("env", {}), ai=data.get("ai", {}),
-                  agents=data.get("agents", {}), path=path)
+                  agents=data.get("agents", {}), path=path,
+                  allow_untracked_dir=bool(data.get("allow_untracked_dir", False)))
 
 
 def _state_file() -> Path:

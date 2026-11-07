@@ -1,49 +1,96 @@
 #+TITLE: bliss TODO
 
+* Direction
+From a review of whether the package makes sense. The core does: run the exact Guix or
+Nix shell, directory and environment elsewhere, with one interface for every target.
+It is built wider than it has been proven.
+** TODO Decide the main use
+Sandboxing AI agents, or moving dev work to bigger machines. The first makes the items
+below the product and lets Kubernetes wait. The second shrinks =ai= to almost nothing and
+makes two-way file sync matter more. This sets the order of everything else here.
+** TODO Run one real agent task end to end
+Through podman, with a real task, then judge whether the result is useful. So far agents
+have only had version checks and login failures; none has completed any work.
+** TODO Replace =pull= with something reviewable
+=pull= drops a full copy in =.bliss/pull/<name>=, and working out what changed is left to the
+user. Return a diff or a git branch that can be reviewed and applied. For agents, the
+result is the point. Decide what happens in a directory that is not a git repository.
+** TODO Send only allowed environment variables by default
+The whole environment travels unless excluded, so secrets reach every target. Send a safe
+default set plus names the user allows. Less magical, but this tool also pushes to
+registries. =bliss run -n= should still list the names. =here= is not affected.
+** TODO Make =ai= thin
+Most of the hard bugs came from it: binary patching, native libraries, the Hermes installer.
+Those fixes can break with any upstream release. Agents already in the Guix or Nix shell
+could use =bliss run=, leaving =ai= as a shortcut for the command and its flags.
+** TODO Narrow what is supported
+Five target types, two package managers and four agents is more than can be kept working.
+- Mark Docker, Nix over ssh and Autolith as experimental in the README.
+- Consider dropping Hermes unless it is actually used.
+- Keep =here= and emacs-bliss; both are small and fit the idea.
+** TODO Clean up pushed Kubernetes images
+Every run bakes the source into a new image and leaves its tag in the registry. =bliss stop=
+and =bliss gc= do not touch registries. Delete the tag on stop where the registry allows it.
+
 * Verify
-** TODO Hermes on =c=: the session disappears
-Passes in podman (v0.22.6). On =c= the session was =gone= by the first status check
-and =logs= found nothing. Not diagnosed. =~/.bashrc= and =~/.bash_profile= were
-unchanged. Disk use grew about 0.9 GB, so the install at least started. Workload
-=calm-swan= is still in a scratch ledger; its directory on =c= goes with the cleanup.
-Possible causes: =LD_LIBRARY_PATH= with Guix's libstdc++ on a host binary, the 1 GB of RAM.
+** TODO =here=: the untested paths
+Tested for real with tmux: directory, environment, exit status, =list=, =logs=, attach,
+detach, =stop=. On 2026-11-06 =bliss -t here ai --json= ran =claude -p= to completion twice
+times from agent-shell-org-loops (from Emacs, through the process API). Not run: screen.
+** TODO emacs-bliss: remote tmux, =eat= and the =term= shell
+Driven in a real Emacs against podman. Not tried: attaching to a remote tmux session (=term=
+and =eat= are given a different =TERM= so that it works), or =eat=, which is not installed here.
+A shell through =term= started and exited, but its output was not seen on screen.
+** TODO Hermes over ssh on a host with enough RAM
+Passes in podman (v0.22.6). The install fixes (=tar= chown in a user namespace, failed
+download marked as installed, pane closing on failure) got further on =c=, through
+dependencies. Its node web UI build then ran the 1 GB host out of memory, so it was
+stopped and never finished. Do not retry on =c=. Needs a host with 4 GB or more.
+Whether =HOME= redirection protects dotfiles was only checked on the partial install.
 ** TODO Autolith: the =prompt= template and bwrap
 =autolith --version= runs in podman. =--detached= then =lg tell=, and bwrap inside a
 container, are untested. Not tried over ssh.
-** TODO Nix: rerun the image test with the =^out= fix
-The backend built a 78-path image, but it failed to start because of the
-wrong-output bug. Rerun was rejected; ask before retrying (pulls about 600 MB).
-Even a pass only covers =nix-shell= in a container, not NixOS itself.
-** TODO Nix: agents and =nix copy= over SSH are untested
-This includes the new unpack-on-target path for Pi (unit test only).
-** TODO Kubernetes: test against a real cluster
-Manifests have unit tests only; nothing has been deployed. =dell-server= has no
-registry and minikube is unreachable. Needs a registry to test against. Same for attach.
+** TODO Nix: =nix copy= over SSH and real NixOS are untested
+Podman images from =nix-shell= inside a container work, including Pi unpacked from its
+tarball, with the =^out= fix. That is not NixOS, and Claude and Autolith on Nix are untested.
 ** TODO Docker engine is untested
 =~/bin/docker= is a wrapper script here, not plain docker.
 ** TODO Build =flake.nix=
 No Nix on this machine. =guix.scm= builds and =bliss --version= runs from it;
 it has not been installed into a profile.
-** TODO =bliss gc= against real targets
-Unit tests only so far.
-** TODO Claude, Pi and Hermes doing real work
-Only version checks so far, and =Not logged in= for unattended Claude: no
-credentials were sent to any target.
+** TODO Claude, Pi, Hermes and Autolith doing real work
+Claude did real read-only research on =here= (2026-11-06), with the login already on this
+machine; the others have only had version checks. =credentials= was tested with a fake Claude login: Claude read
+it and failed to refresh it. A real login has not been sent anywhere. Whether a target
+refreshing its copy signs out the original is unknown. Pi =auth.json= has unit tests only.
+** TODO Kubernetes through =registry.xk.is= directly
+Works with =pull_registry = "10.111.38.97:5000"=, because the cluster node cannot resolve
+=registry.xk.is=. Four test tags remain in the registry: quick-finch, jolly-puffin, kind-moose, rosy-puffin.
 
 * Build
-** TODO Agent credentials
-Only env vars travel today (e.g. =ANTHROPIC_API_KEY=). Logins stored in files such
-as =~/.claude/.credentials.json= are not copied. Decide whether to add an explicit
-opt-in setting. Over ssh it must not overwrite the remote user's own login.
+** TODO Keep output and status without keeping the session
+After the command, run.sh keeps an interactive shell open, because =logs= reads the live pane
+and =status= checks the session first. So every finished workload holds a session, and its
+=env.sh= (the whole environment, secrets included) stays until =stop=. Write the output to a
+file in the workload directory, have =status= read =exit= even with no session, and =logs=
+read the file; then a non-interactive =ai PROMPT= run need not keep a shell.
+agent-shell-org-loops stops in-place workloads once it has the reply, as a stopgap.
+** TODO =gc= on =here= leaves orphaned workload directories
+=HereTarget.gc= only logs a message, and only =stop= removes =state_dir()/workloads/<id>=.
+A session that dies without =stop= leaves its =env.sh= behind. Remove directories no
+record refers to, honouring =--dry-run=. (Found by an agent run, 2026-11-06.)
 ** TODO Non-x86_64 hosts
 Now fails early with a clear error. Agent URLs, the loader path and the Nix image
 are still hardcoded to x86_64.
 ** TODO =bliss logs -f= on ssh targets
 Prints a notice and shows the output so far. =tmux pipe-pane= could provide it.
+** TODO =bliss gc= leaves =~/.bliss/lib= on ssh targets
+Only symlinks, recreated on each run.
 
-* Clean up
-** TODO Remove =~/.bliss= from =c=
-About 1.4 GB or more, created by testing; it did not exist before. Keep it until the
-Hermes failure is understood. Leave tmux session =0= and the existing screen session alone.
-** TODO Remove local test images
-=bliss-sys:*= images in podman, from testing. =bliss gc= should cover them.
+* Outside this repo
+** TODO Decide on commits
+Only =06b8619= exists. Later bliss changes and all of =~/git/emacs-bliss= are uncommitted, by
+request.
+** TODO Check what was lost on =c=
+A Hermes test ran =c= out of memory on 2026-11-03 (UTC). The kernel killed =rlwrap= and its
+=java= process, and tmux session =0= was gone afterwards. Restart whatever ran there.
