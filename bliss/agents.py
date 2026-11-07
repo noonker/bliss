@@ -46,6 +46,13 @@ class Agent:
     # directory, so these are made visible, and nothing else from the profile.
     native_libs: tuple[str, ...] = ()
     gcc_runtime: bool = False  # needs libgcc_s and libstdc++ in the pack
+    # An in-place install below this much RAM can trigger the host's OOM killer,
+    # which then takes down whatever else lives there.
+    min_install_memory_mb: int = 0
+    # The variable that moves its config directory, which is how credentials
+    # reach it without touching a login that already exists on the target.
+    config_env: str | None = None
+    credentials: tuple[str, ...] = ()
 
 
 _CLAUDE_BASE = "https://downloads.claude.ai/claude-code-releases"
@@ -61,6 +68,7 @@ BUILTIN: dict[str, Agent] = {
         # Containers run as root, where Claude refuses that flag unless told it
         # is sandboxed. An ssh target is a real machine, so it never gets this.
         sandbox_env=(("IS_SANDBOX", "1"),),
+        config_env="CLAUDE_CONFIG_DIR",
         guix_deps=("git", "ripgrep"),
         nix_deps=("git", "ripgrep"),
     ),
@@ -91,6 +99,7 @@ BUILTIN: dict[str, Agent] = {
         # uv, its Python and native wheels are glibc builds needing these.
         native_libs=("libgcc_s.so*", "libstdc++.so*", "libatomic.so*"),
         gcc_runtime=True,
+        min_install_memory_mb=4096,  # it builds a web UI with node
     ),
     "pi": Agent(
         name="pi", kind="tarball",
@@ -100,6 +109,7 @@ BUILTIN: dict[str, Agent] = {
         guix_deps=("git", "ripgrep", "fd"),
         nix_deps=("git", "ripgrep", "fd"),
         bin_rel="",
+        config_env="PI_CODING_AGENT_DIR",
     ),
 }
 
@@ -113,9 +123,33 @@ def get_agent(config: Config, name: str | None) -> Agent:
     overrides = config.agents.get(name, {})
     changes = {key: tuple(overrides[key])
                for key in ("interactive", "prompt", "unattended") if key in overrides}
+    if "min_install_memory_mb" in overrides:
+        changes["min_install_memory_mb"] = int(overrides["min_install_memory_mb"])
+    if "credentials" in overrides:
+        if not agent.config_env:
+            raise BlissError(f"[agents.{name}] credentials: {name} has no way to read them "
+                             "from a separate directory, so bliss cannot send them safely")
+        changes["credentials"] = tuple(overrides["credentials"])
     if "version" in overrides:
         changes["version"] = str(overrides["version"])
     return replace(agent, **changes)
+
+
+def read_credentials(agent: Agent) -> dict[str, str]:
+    """The files the user opted to send, by the name the agent expects."""
+    found: dict[str, str] = {}
+    for path in agent.credentials:
+        full = os.path.expanduser(path)
+        name = os.path.basename(full)
+        if name in found:
+            raise BlissError(f"[agents.{agent.name}] credentials: two files are named {name}")
+        try:
+            with open(full, encoding="utf-8") as handle:
+                found[name] = handle.read()
+        except OSError as err:
+            raise BlissError(f"[agents.{agent.name}] credentials: cannot read {path}: "
+                             f"{err.strerror}") from err
+    return found
 
 
 def agent_command(agent: Agent, prompt: str | None, unattended: bool) -> list[str]:

@@ -6,11 +6,11 @@ import io
 import os
 import subprocess
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..capture import env_script, tar_directory
-from ..runtime import run_script
+from ..runtime import CREDENTIAL_PREFIX, run_script
 from ..system import AgentSpec, Pack
 from ..util import BlissError, tool, tool_path
 
@@ -23,19 +23,25 @@ class Workload:
     env: dict[str, str]
     spec: AgentSpec | None = None
     unattended: bool = False
+    credentials: dict[str, str] = field(default_factory=dict)
 
     def scripts(self, pack: Pack, *, cache_prefix: str, keep_session: bool = False,
-                sandboxed: bool = False) -> dict[str, str]:
+                sandboxed: bool = False, credentials_dir: str = "$HOME/.bliss-agent-config",
+                ) -> dict[str, str]:
         """The small files every target delivers beside the system.
 
         `sandboxed` says the workload is confined to a container or pod.
+        `credentials_dir` is where the agent's copy of its login goes; it must
+        be writable and go away with the workload.
         """
         extra = dict(self.spec.agent.sandbox_env) if self.spec and self.unattended and sandboxed else {}
         return {
             "env.sh": env_script(self.env),
             "run.sh": run_script(pack, self.command, spec=self.spec,
                                  cache_prefix=cache_prefix, keep_session=keep_session,
-                                 extra_env=extra),
+                                 extra_env=extra,
+                                 credentials_dir=credentials_dir if self.credentials else None),
+            **{CREDENTIAL_PREFIX + name: text for name, text in self.credentials.items()},
         }
 
 

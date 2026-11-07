@@ -18,6 +18,14 @@ def k8s_name(wid: str) -> str:
     return name[:63].rstrip("-")
 
 
+def pull_image(image: str, registry: str, spec: dict) -> str:
+    """The image as the cluster names it, which may differ from the pushed name."""
+    pull_registry = spec.get("pull_registry")
+    if not pull_registry:
+        return image
+    return pull_registry.rstrip("/") + image[len(registry.rstrip("/")):]
+
+
 def manifests(name: str, image: str, scripts: dict[str, str], spec: dict) -> list[dict]:
     """env.sh is a Secret and files are in the image, so a restart keeps both."""
     labels = {"app.kubernetes.io/managed-by": "bliss", "bliss/workload": name}
@@ -88,7 +96,7 @@ class KubernetesTarget:
             "registry can read anything not in .blissignore")
         run([*self.engine, "push", *self.spec.get("push_args", []), image], quiet=True)
         scripts = workload.scripts(pack, cache_prefix=IMAGE_CACHE, sandboxed=True)
-        objects = manifests(name, image, scripts, self.spec)
+        objects = manifests(name, pull_image(image, registry, self.spec), scripts, self.spec)
         document = json.dumps({"apiVersion": "v1", "kind": "List", "items": objects})
         run([*self.kubectl(), "apply", "-f", "-"], input=document.encode(), quiet=True)
         return {"name": name, "image": image}

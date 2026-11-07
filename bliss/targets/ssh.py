@@ -7,7 +7,7 @@ import shlex
 from pathlib import Path
 
 from ..runtime import agent_cache
-from ..system import Pack, System
+from ..system import AgentSpec, Pack, System
 from ..util import BlissError, exec_tool, log, output, run
 from .base import Workload, bytes_tar, pull_tar, stream_files_to
 
@@ -34,9 +34,9 @@ done
 """
 
 
-def tmux_logs_command(name: str) -> str:
+def tmux_logs_command(name: str, tmux: str = "tmux") -> str:
     """The whole pane; tmux pads the bottom with blank lines, so drop those."""
-    return (f"tmux capture-pane -p -J -S - -t ={name}: | "
+    return (f"{tmux} capture-pane -p -J -S - -t ={name}: | "
             "sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}'")
 
 
@@ -46,11 +46,13 @@ class SshTarget:
         self.spec = spec
         self.host = spec["host"]
         self.session = spec.get("session", "tmux")
+        self.tmux = "tmux"
         self.ssh = [*spec.get("ssh_command", ["ssh"]), *spec.get("ssh_args", [])]
 
-    def _remote(self, script: str, *, tty: bool = False) -> list[str]:
+    def _remote(self, script: str, *, tty: bool = False, connect_timeout: int | None = None) -> list[str]:
         # ssh joins its arguments with spaces and hands them to the remote shell.
-        return [*self.ssh, *(["-t"] if tty else []), self.host, script]
+        timeout = ["-o", f"ConnectTimeout={connect_timeout}"] if connect_timeout else []
+        return [*self.ssh, *timeout, *(["-t"] if tty else []), self.host, script]
 
     def _dir(self, wid: str) -> str:
         return f"$HOME/{REMOTE_ROOT}/workloads/{wid}"
@@ -77,6 +79,21 @@ class SshTarget:
         run(["nix", "--extra-experimental-features", "nix-command", "copy",
              "--to", f"ssh://{self.host}", *pack.store_paths])
 
+    def _check_install_memory(self, spec: AgentSpec) -> None:
+        """Refuse an install that could make the host's OOM killer hit other work."""
+        needed = spec.agent.min_install_memory_mb
+        if not needed:
+            return
+        cache = agent_cache(spec.agent, spec.release, f"$HOME/{REMOTE_ROOT}/cache/agents")
+        script = (f'if [ -e "{cache}/.ok" ]; then echo 0; else '
+                  "awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo; fi")
+        total = int(output(self._remote(script)) or 0)
+        if total and total < needed:
+            raise BlissError(
+                f"installing {spec.agent.name} needs about {needed} MB of RAM and {self.host} has "
+                f"{total} MB; it could run the host out of memory and kill other processes. "
+                f"To accept that, set min_install_memory_mb = 0 under [agents.{spec.agent.name}].")
+
     def _session_name(self, wid: str) -> str:
         return f"bliss-{wid}"
 
@@ -89,6 +106,8 @@ class SshTarget:
         if remote_arch != platform.machine():
             raise BlissError(f"{self.host} is {remote_arch} but this machine is "
                              f"{platform.machine()}; the system pack would not run there")
+        if workload.spec:
+            self._check_install_memory(workload.spec)
         pack = system.build("relocatable", workload.spec)
         directory = self._dir(workload.id)
         work = f"{directory}/work"
@@ -107,7 +126,9 @@ class SshTarget:
             bash = f"{pack_dir}/bin/bash"
             root_env = f'BLISS_ROOT="{pack_dir}" '
         scripts = workload.scripts(pack, cache_prefix=f"$HOME/{REMOTE_ROOT}/cache/agents",
-                                   keep_session=True)
+                                   keep_session=True,
+                                   # Inside the workload, so 'bliss stop' removes it.
+                                   credentials_dir='$BLISS_DIR/agent-config')
         run(self._remote(f'tar xf - -C "{directory}"'), input=bytes_tar(scripts))
         count, size = stream_files_to(workload.root, self._remote(f'tar xf - -C "{work}"'))
         log(f"sent {count} files ({size / 1e6:.1f} MB)")
@@ -123,7 +144,7 @@ class SshTarget:
 
     def _alive_check(self, name: str) -> str:
         if self.session == "tmux":
-            return f"tmux has-session -t ={name} 2>/dev/null"
+            return f"{self.tmux} has-session -t ={name} 2>/dev/null"
         return f"screen -ls {name} 2>/dev/null | grep -q {name}"
 
     def status(self, record: dict) -> str:
@@ -132,22 +153,21 @@ class SshTarget:
                   f'echo "exited($(cat "{record["dir"]}/exit"))"; else echo running; fi; '
                   f"else echo gone; fi")
         # Quick to give up, so a dead host does not stall 'bliss list'.
-        proc = run([*self.ssh, "-o", "ConnectTimeout=5", self.host, script],
-                   capture=True, check=False)
+        proc = run(self._remote(script, connect_timeout=5), capture=True, check=False)
         return proc.stdout.decode().strip() if proc.returncode == 0 else "unknown"
 
     def attach(self, record: dict) -> int:
         name = record["session"]
-        cmd = f"tmux attach -t ={name}" if self.session == "tmux" else f"screen -r {name}"
+        cmd = f"{self.tmux} attach -t ={name}" if self.session == "tmux" else f"screen -r {name}"
         return exec_tool(self._remote(cmd, tty=True))
 
     def logs(self, record: dict, follow: bool) -> int:
         name = record["session"]
         if follow:
-            log("--follow is not supported on ssh targets; showing the output so far "
+            log("--follow is not supported on session targets; showing the output so far "
                 "(use 'bliss attach' to watch it)")
         if self.session == "tmux":
-            return exec_tool(self._remote(tmux_logs_command(name)))
+            return exec_tool(self._remote(tmux_logs_command(name, self.tmux)))
         out = f'{record["dir"]}/screen.log'
         return exec_tool(self._remote(f'screen -S {name} -X hardcopy -h "{out}" && sleep 1 && cat "{out}"'))
 
@@ -156,7 +176,7 @@ class SshTarget:
 
     def stop(self, record: dict) -> None:
         name = record["session"]
-        kill = f"tmux kill-session -t ={name}" if self.session == "tmux" else f"screen -S {name} -X quit"
+        kill = f"{self.tmux} kill-session -t ={name}" if self.session == "tmux" else f"screen -S {name} -X quit"
         run(self._remote(f'{kill} 2>/dev/null; rm -rf "{record["dir"]}"'), check=False, quiet=True)
 
     def gc(self, dry_run: bool) -> None:

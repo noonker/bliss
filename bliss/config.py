@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .util import BlissError, state_dir
 
-TARGET_TYPES = {"podman", "docker", "ssh", "kubernetes"}
+TARGET_TYPES = {"here", "podman", "docker", "ssh", "kubernetes"}
 
 
 def config_path() -> Path:
@@ -45,7 +45,8 @@ def load_config(path: Path | None = None) -> Config:
             data = tomllib.loads(path.read_text())
         except tomllib.TOMLDecodeError as err:
             raise BlissError(f"{path}: {err}") from err
-    targets = data.get("targets", {})
+    # Always there, so `bliss -t here` needs no settings at all.
+    targets = {"here": {"type": "here"}, **data.get("targets", {})}
     for name, spec in targets.items():
         kind = spec.get("type")
         if kind not in TARGET_TYPES:
@@ -53,7 +54,7 @@ def load_config(path: Path | None = None) -> Config:
                              f"{sorted(TARGET_TYPES)}, got {kind!r}")
         if kind == "ssh" and "host" not in spec:
             raise BlissError(f"target '{name}': ssh targets need 'host'")
-        if kind == "ssh" and spec.get("session", "tmux") not in ("tmux", "screen"):
+        if kind in ("ssh", "here") and spec.get("session", "tmux") not in ("tmux", "screen"):
             raise BlissError(f"target '{name}': session must be tmux or screen")
         if kind == "kubernetes" and spec.get("kind", "pod") not in ("pod", "deployment"):
             raise BlissError(f"target '{name}': kind must be pod or deployment")

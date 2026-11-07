@@ -9,6 +9,20 @@ from .agents import Agent, Release
 from .system import LOADER, AgentSpec, Pack
 
 
+_EXIT_ON_FAILURE = 'bliss_fail() { exit "$1"; }\n'
+# In a session, keep the pane: otherwise the error vanishes along with it.
+_KEEP_FAILURE = textwrap.dedent("""\
+    bliss_fail() {
+      echo "$1" > "$BLISS_DIR/exit"
+      echo "[bliss] setup failed with status $1; this is a shell for looking into it"
+      exec bash -i
+    }
+    """)
+
+
+CREDENTIAL_PREFIX = "credential-"
+
+
 def _dq(expr: str) -> str:
     """Double-quote a shell expression so its $VARS still expand."""
     return '"' + expr.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -59,9 +73,12 @@ def install_agent_script(spec: AgentSpec, cache: str) -> str:
           mkdir -p "$cache"
           # Its own HOME: the installer otherwise edits ~/.bashrc and ~/.profile.
           mkdir -p "$cache/.home"
-          curl -fsSL {shlex.quote(agent.installer_url or "")} |
-            HOME="$cache/.home" SHELL=/bin/bash HERMES_HOME="$cache" bash -s -- {joined} \\
-              --dir "$cache/hermes-agent" --hermes-home "$cache" || exit 1
+          # Saved first: in `curl | bash` a failed download looks like success.
+          curl -fsSL {shlex.quote(agent.installer_url or "")} -o "$cache/install.sh" || bliss_fail $?
+          # A relocatable pack runs in a user namespace, where tar cannot chown.
+          HOME="$cache/.home" SHELL=/bin/bash HERMES_HOME="$cache" TAR_OPTIONS=--no-same-owner \\
+            bash "$cache/install.sh" {joined} \\
+              --dir "$cache/hermes-agent" --hermes-home "$cache" || bliss_fail $?
           touch "$cache/.ok"
         fi
         """)
@@ -92,7 +109,7 @@ def _unpack_agent_script(agent: Agent, pack: Pack, cache: str) -> str:
         if [ ! -e "$cache/.ok" ]; then
           tmp="$cache.tmp.$$"
           mkdir -p "$tmp"
-          tar xzf {_dq(pack.agent_root)} -C "$tmp" --strip-components=1 || exit 1
+          tar xzf {_dq(pack.agent_root)} -C "$tmp" --strip-components=1 || bliss_fail $?
           if [ ! -e {LOADER} ]; then
 {patch}
           fi
@@ -130,9 +147,16 @@ def prepare_agent_script(spec: AgentSpec, pack: Pack, cache_prefix: str) -> str:
                 + f'export PATH="$cache/{agent.venv_bin}:$PATH"\n')
     if not pack.uses_profile and agent.flake:
         return "unset LD_LIBRARY_PATH\n"  # built by Nix, nothing foreign to run
-    source = pack.agent_root
     if agent.kind == "tarball" and not pack.uses_profile:
         return _unpack_agent_script(agent, pack, cache)
+    # In a relocatable pack the profile holds a wrapper that re-enters the
+    # namespace, and patching that breaks it. The release itself is the store
+    # item with the exact name; the wrapper's name has an extra "R". Grafting can
+    # leave a second copy of the same release, and either one will do.
+    source = "$release" if pack.uses_profile else pack.agent_root
+    find_release = (f'for release in /gnu/store/*-bliss-agent-{agent.name}-'
+                    f'{release.version.lstrip("v")}; do break; done'
+                    if pack.uses_profile else ":")
     # A profile holds the package, whereas Nix fetches the bare executable.
     is_flat = not pack.uses_profile
     source_dir = f"{source}/libexec/{agent.name}" if agent.kind == "tarball" else ""
@@ -157,7 +181,8 @@ def prepare_agent_script(spec: AgentSpec, pack: Pack, cache_prefix: str) -> str:
             echo "bliss: no {LOADER} here; patching a cached copy of {agent.name}" >&2
             tmp="$cache.tmp.$$"
             mkdir -p "$tmp"
-            {copy}
+            {find_release}
+            {copy} || bliss_fail $?
             chmod -R u+w "$tmp"
 {patch}
             touch "$tmp/.ok"
@@ -174,26 +199,62 @@ def _append_to_path(bin_dirs: tuple[str, ...]) -> str:
                    for d in bin_dirs)
 
 
+def _credentials_script(agent: Agent, config_dir: str) -> str:
+    """Point the agent at a private, writable config directory holding the files.
+
+    A copy, because a Kubernetes Secret is read-only and agents refresh their
+    tokens. An existing file is kept, so a restarted pod keeps a refreshed token.
+    """
+    return textwrap.dedent(f"""\
+        config={_dq(config_dir)}
+        (umask 077; mkdir -p "$config")
+        for f in "$BLISS_DIR"/{CREDENTIAL_PREFIX}*; do
+          name=${{f##*/{CREDENTIAL_PREFIX}}}
+          if [ ! -e "$config/$name" ]; then
+            (umask 077; cp -L "$f" "$config/$name"; chmod 600 "$config/$name")
+          fi
+        done
+        export {agent.config_env}="$config"
+        """)
+
+
+def _keep_session_tail(run_line: str, bash: str = "bash") -> str:
+    """Keep the pane alive so output can be read and `bliss status` knows why."""
+    return textwrap.dedent(f"""\
+        {run_line}
+        rc=$?
+        echo "$rc" > "$BLISS_DIR/exit"
+        echo "[bliss] command exited with status $rc; this is a shell in the same environment"
+        exec {shlex.quote(bash)} -i
+        """)
+
+
+def in_place_script(command: list[str], bash: str) -> str:
+    """run.sh for this machine: no system to find, nothing to install.
+
+    `bash` is a full path, since the environment may be a pure shell without it.
+    """
+    return ('. "$BLISS_DIR/env.sh"\ncd "$BLISS_WORK" || exit 1\n'
+            + _keep_session_tail(shlex.join(command), bash))
+
+
 def run_script(pack: Pack, command: list[str], *, spec: AgentSpec | None,
                cache_prefix: str, keep_session: bool = False,
-               extra_env: dict[str, str] | None = None) -> str:
+               extra_env: dict[str, str] | None = None,
+               credentials_dir: str | None = None) -> str:
     """run.sh: expects BLISS_DIR, BLISS_WORK and (for a profile) BLISS_ROOT."""
-    parts = ["#!/bin/bash\n", prelude(pack), '. "$BLISS_DIR/env.sh"\n',
+    parts = ["#!/bin/bash\n", _KEEP_FAILURE if keep_session else _EXIT_ON_FAILURE,
+             prelude(pack), '. "$BLISS_DIR/env.sh"\n',
              _append_to_path(pack.bin_dirs), "export PATH\n"]
     parts += [f"export {key}={shlex.quote(value)}\n" for key, value in (extra_env or {}).items()]
     if spec:
         parts.append(prepare_agent_script(spec, pack, cache_prefix))
+    if spec and credentials_dir:
+        parts.append(_credentials_script(spec.agent, credentials_dir))
     parts.append('cd "$BLISS_WORK" || exit 1\n')
     run_line = shlex.join(command)
     if keep_session:
-        # Keep the pane alive so output can be read and `bliss status` knows why.
-        parts.append(textwrap.dedent(f"""\
-            {run_line}
-            rc=$?
-            echo "$rc" > "$BLISS_DIR/exit"
-            echo "[bliss] command exited with status $rc; this is a shell in the same environment"
-            exec bash -i
-            """))
+        parts.append(_keep_session_tail(run_line))
     else:
         parts.append(f"exec {run_line}\n")
     return "".join(parts)
@@ -202,5 +263,5 @@ def run_script(pack: Pack, command: list[str], *, spec: AgentSpec | None,
 def image_install_script(spec: AgentSpec, pack: Pack, cache_prefix: str) -> str:
     """Image-build step for agents that install in place, cached as a layer."""
     cache = agent_cache(spec.agent, spec.release, cache_prefix)
-    return ("#!/bin/bash\n" + prelude(pack) + _native_libs_script(spec.agent)
+    return ("#!/bin/bash\n" + _EXIT_ON_FAILURE + prelude(pack) + _native_libs_script(spec.agent)
             + install_agent_script(spec, cache))

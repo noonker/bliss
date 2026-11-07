@@ -1,5 +1,11 @@
 # ~/.config/bliss/config.toml  (or point BLISS_CONFIG at a file)
 
+# "here" always exists and needs no settings: it runs in place on this machine, in a
+# session on its own tmux server (`tmux -L bliss ls`). Define it only to use screen.
+# [targets.here]
+# type = "here"
+# session = "screen"
+
 [targets.local]
 type = "podman"                 # or "docker"
 # command = ["podman", "--remote", "--connection", "gpu-box"]
@@ -14,6 +20,7 @@ session = "tmux"                # or "screen"; must be installed on the server
 type = "kubernetes"
 kind = "pod"                    # or "deployment"
 registry = "registry.example.com/me"   # required: the cluster pulls from here
+# pull_registry = "10.0.0.5:5000"      # if the cluster reaches that registry at another address
 # context = "admin@cluster"
 # namespace = "default"
 # image_pull_secret = "regcred"
@@ -36,3 +43,10 @@ unattended = false              # true: agents act without approval prompts
 [agents.claude]
 # version = "2.1.317"
 # prompt = ["claude", "-p", "{prompt}", "--model", "opus"]
+#
+# Send a login along. Off unless listed, and only for claude and pi. Anyone with
+# root on the target, or who can read Secrets in the namespace, can use it.
+# credentials = ["~/.claude/.credentials.json"]
+#
+# [agents.pi]
+# credentials = ["~/.pi/agent/auth.json"]

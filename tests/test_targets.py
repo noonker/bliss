@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import shutil
+import stat
 import subprocess
 import tarfile
 import unittest
@@ -9,12 +11,16 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from bliss.agents import BUILTIN, Release
-from bliss.runtime import _native_libs_script, prepare_agent_script, run_script
+from bliss.runtime import _credentials_script, _native_libs_script, prepare_agent_script, run_script
 from bliss.system import AgentSpec, Pack, guix_manifest, nix_shell_roots, write_docker_archive
 from bliss.targets.base import Workload
-from bliss.targets.image import unused_system_images
-from bliss.targets.kubernetes import k8s_name, manifests
-from bliss.targets.ssh import GC_SCRIPT, tmux_logs_command
+from bliss.targets.image import ensure_system_image, unused_system_images
+from bliss.targets.kubernetes import k8s_name, manifests, pull_image
+from bliss.targets.ssh import GC_SCRIPT, SshTarget, tmux_logs_command
+from bliss.util import BlissError
+
+# A full path, as bliss needs; /bin/bash is missing in a Guix build or on NixOS.
+BASH = shutil.which("bash") or "/bin/bash"
 
 SPEC = AgentSpec(BUILTIN["claude"], Release("1.0.0", "https://x/claude", "ab" * 32))
 GUIX = Pack(format="docker-archive", key="k", uses_profile=True, bin_dirs=("$BLISS_PROFILE/bin",),
@@ -41,6 +47,12 @@ class KubernetesTest(unittest.TestCase):
         self.assertEqual(deploy["metadata"]["namespace"], "ns")
         self.assertEqual(deploy["spec"]["selector"]["matchLabels"]["bliss/workload"], "n")
 
+    def test_pull_registry_only_changes_the_address(self):
+        image = "reg.example/me/bliss-work:x"
+        self.assertEqual(pull_image(image, "reg.example/me", {}), image)
+        self.assertEqual(pull_image(image, "reg.example/me/", {"pull_registry": "10.0.0.5:5000/"}),
+                         "10.0.0.5:5000/bliss-work:x")
+
     def test_name_is_valid(self):
         name = k8s_name("My_Project.Name-" + "x" * 80)
         self.assertLessEqual(len(name), 63)
@@ -65,6 +77,15 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("--set-interpreter", script)
         self.assertNotIn("--set-rpath", script)
 
+    def test_patches_the_release_not_the_relocation_wrapper(self):
+        script = prepare_agent_script(SPEC, GUIX, "$HOME/c")
+        self.assertIn("for release in /gnu/store/*-bliss-agent-claude-1.0.0; do break; done", script)
+        self.assertIn('cp -L "$release/bin/claude" "$tmp/claude" || bliss_fail $?', script)
+        self.assertNotIn('cp -L "$BLISS_PROFILE', script)
+        tarball = prepare_agent_script(AgentSpec(BUILTIN["pi"], Release("v1.5.0", "u", "s")), GUIX, "$HOME/c")
+        self.assertIn("/gnu/store/*-bliss-agent-pi-1.5.0; do break", tarball)
+        self.assertIn('cp -rL "$release/libexec/pi"/.', tarball)
+
     def test_run_scripts_parse(self):
         for pack, spec in ((GUIX, None), (GUIX, SPEC),
                            (GUIX, AgentSpec(BUILTIN["hermes"], Release("stable", "u", ""))),
@@ -86,7 +107,7 @@ class ScriptTest(unittest.TestCase):
             root = Path(tmp)
             (root / "env.sh").write_text(env_sh)
             pack = Pack(format="relocatable", key="k", bin_dirs=(f"{tmp}/pack/bin",),
-                        ca_file="c", bash="/bin/bash")
+                        ca_file="c", bash=BASH)
             script = run_script(pack, ["printenv", "PATH"], spec=None, cache_prefix="$HOME/c")
             return subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True, check=True,
@@ -107,13 +128,13 @@ class ScriptTest(unittest.TestCase):
             root = Path(tmp)
             release = root / "pi"
             release.mkdir()
-            (release / "pi").write_text("#!/bin/sh\necho ran\n")
+            (release / "pi").write_text(f"#!{BASH}\necho ran\n")
             (release / "pi").chmod(0o755)
             archive = root / "pi.tar.gz"
             subprocess.run(["tar", "czf", archive, "-C", tmp, "pi"], check=True)
             (root / "env.sh").write_text("")
             pack = Pack(format="nix-closure", key="k", agent_root=str(archive),
-                        bin_dirs=(), ca_file="c", patchelf="true", loader="l", bash="/bin/bash")
+                        bin_dirs=(), ca_file="c", patchelf="true", loader="l", bash=BASH)
             spec = AgentSpec(BUILTIN["pi"], Release("v1", "u", "s"))
             script = run_script(pack, ["pi"], spec=spec, cache_prefix=f"{tmp}/cache")
             env = {"BLISS_DIR": tmp, "BLISS_WORK": tmp, "HOME": tmp, "PATH": os.environ["PATH"]}
@@ -121,6 +142,38 @@ class ScriptTest(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                                         check=True, env=env)
                 self.assertEqual(result.stdout, "ran\n")
+
+    def _install_with_fake_curl(self, tmp, curl_body):
+        root = Path(tmp)
+        fake = root / "fake"
+        fake.mkdir()
+        (fake / "curl").write_text(f"#!{BASH}\n" + curl_body)
+        (fake / "curl").chmod(0o755)
+        (root / "env.sh").write_text("")
+        pack = Pack(format="relocatable", key="k", bin_dirs=(), ca_file="c", bash=BASH)
+        spec = AgentSpec(BUILTIN["hermes"], Release("stable", "u", ""))
+        script = run_script(pack, ["true"], spec=spec, cache_prefix=f"{tmp}/cache", keep_session=True)
+        env = {"BLISS_DIR": tmp, "BLISS_WORK": tmp, "HOME": tmp,
+               "PATH": f"{fake}:{os.environ['PATH']}"}
+        return subprocess.run(["bash", "-c", script], stdin=subprocess.DEVNULL, env=env,
+                              capture_output=True, text=True)
+
+    def test_failed_download_is_not_recorded_as_installed(self):
+        with TemporaryDirectory() as tmp:
+            result = self._install_with_fake_curl(tmp, "exit 7\n")
+            self.assertIn("setup failed with status 7", result.stdout)
+            self.assertEqual((Path(tmp) / "exit").read_text().strip(), "7")
+            self.assertFalse((Path(tmp) / "cache/hermes-stable/.ok").exists())
+
+    def test_failed_installer_keeps_the_session_and_tar_cannot_chown(self):
+        with TemporaryDirectory() as tmp:
+            # The fake curl "downloads" an installer that reports TAR_OPTIONS and fails.
+            body = ('while [ "$1" != "-o" ]; do shift; done\n'
+                    "printf 'echo \"tar=$TAR_OPTIONS\"\\nexit 3\\n' > \"$2\"\n")
+            result = self._install_with_fake_curl(tmp, body)
+            self.assertIn("tar=--no-same-owner", result.stdout)
+            self.assertIn("setup failed with status 3", result.stdout)
+            self.assertFalse((Path(tmp) / "cache/hermes-stable/.ok").exists())
 
     def test_native_libs_exclude_the_profile_glibc(self):
         with TemporaryDirectory() as tmp:
@@ -151,6 +204,106 @@ class UnattendedTest(unittest.TestCase):
         self.assertIn("export IS_SANDBOX=1", self.script(unattended=True, sandboxed=True))
         self.assertNotIn("IS_SANDBOX", self.script(unattended=True, sandboxed=False))
         self.assertNotIn("IS_SANDBOX", self.script(unattended=False, sandboxed=True))
+
+
+class InstallMemoryTest(unittest.TestCase):
+    SPEC = AgentSpec(BUILTIN["hermes"], Release("stable", "u", ""))
+
+    def check(self, reply, spec=None):
+        target = SshTarget("c", {"host": "h"})
+        with mock.patch("bliss.targets.ssh.output", return_value=reply):
+            target._check_install_memory(spec or self.SPEC)
+
+    def test_small_host_is_refused(self):
+        with self.assertRaisesRegex(BlissError, "949 MB"):
+            self.check("949")
+
+    def test_large_host_or_finished_install_is_allowed(self):
+        self.check("8192")
+        self.check("0")  # the script reports 0 once the agent is installed
+
+    def test_agents_that_install_nothing_are_not_checked(self):
+        target = SshTarget("c", {"host": "h"})
+        with mock.patch("bliss.targets.ssh.output", side_effect=AssertionError):
+            target._check_install_memory(SPEC)
+
+
+class CredentialsTest(unittest.TestCase):
+    def workload(self, credentials):
+        return Workload(id="w", root=Path("."), command=["claude"], env={}, spec=SPEC,
+                        credentials=credentials)
+
+    def test_nothing_changes_without_opting_in(self):
+        scripts = self.workload({}).scripts(GUIX, cache_prefix="$HOME/c")
+        self.assertEqual(set(scripts), {"env.sh", "run.sh"})
+        self.assertNotIn("CLAUDE_CONFIG_DIR", scripts["run.sh"])
+
+    def test_copy_is_private_and_existing_login_is_untouched(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home_login = root / ".claude/.credentials.json"
+            home_login.parent.mkdir()
+            home_login.write_text("the remote user's own")
+            scripts = self.workload({".credentials.json": "sent"}).scripts(
+                GUIX, cache_prefix="$HOME/c", credentials_dir="$BLISS_DIR/agent-config")
+            for name, text in scripts.items():
+                if name.startswith("credential-"):
+                    (root / name).write_text(text)
+            script = _credentials_script(BUILTIN["claude"], "$BLISS_DIR/agent-config")
+            result = subprocess.run(
+                ["bash", "-c", script + 'echo "$CLAUDE_CONFIG_DIR"'], capture_output=True, text=True,
+                check=True, env={"BLISS_DIR": tmp, "HOME": tmp, "PATH": os.environ["PATH"]})
+            config = root / "agent-config"
+            self.assertEqual(result.stdout.strip(), str(config))
+            self.assertEqual((config / ".credentials.json").read_text(), "sent")
+            self.assertEqual(stat.S_IMODE((config / ".credentials.json").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o700)
+            self.assertEqual(home_login.read_text(), "the remote user's own")
+
+    def test_a_refreshed_token_survives_a_restart(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "credential-auth.json").write_text("original")
+            (root / "credential-read-only").write_text("x")
+            (root / "credential-read-only").chmod(0o400)  # as a Secret mounts it
+            (root / "agent-config").mkdir()
+            (root / "agent-config/auth.json").write_text("refreshed")
+            subprocess.run(["bash", "-c", _credentials_script(BUILTIN["pi"], "$BLISS_DIR/agent-config")],
+                           check=True, env={"BLISS_DIR": tmp, "PATH": os.environ["PATH"]})
+            self.assertEqual((root / "agent-config/auth.json").read_text(), "refreshed")
+            self.assertEqual(stat.S_IMODE((root / "agent-config/read-only").stat().st_mode), 0o600)
+
+    def test_kubernetes_keeps_it_in_the_secret_under_a_valid_key(self):
+        scripts = self.workload({".credentials.json": "hunter2"}).scripts(
+            GUIX, cache_prefix="$HOME/c", sandboxed=True)
+        secret, pod = manifests("n", "i", scripts, {})
+        self.assertNotIn("hunter2", json.dumps(pod))
+        for key in secret["data"]:
+            self.assertRegex(key, r"^[-._a-zA-Z0-9]+$")
+            self.assertNotIn("..", key)  # Kubernetes rejects keys containing it
+
+
+class SystemImageTest(unittest.TestCase):
+    def load(self, loaded_name):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(returncode=1)  # `image inspect`: not loaded yet
+
+        with mock.patch("bliss.targets.image.run", fake_run), \
+                mock.patch("bliss.targets.image.output",
+                           return_value=f"Loaded image: {loaded_name}"):
+            ensure_system_image(["podman"], Pack(format="docker-archive", key="k", path="p"))
+        return [cmd for cmd in calls if cmd[1] == "rmi"]
+
+    def test_nix_image_is_not_removed_as_its_own_alias(self):
+        self.assertEqual(self.load("localhost/bliss-sys:k"), [])
+        self.assertEqual(self.load("bliss-sys:k"), [])
+
+    def test_guix_chosen_name_is_dropped(self):
+        self.assertEqual(self.load("localhost/bliss-sys.abc:latest"),
+                         [["podman", "rmi", "localhost/bliss-sys.abc:latest"]])
 
 
 class GcTest(unittest.TestCase):

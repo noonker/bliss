@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from bliss import cli, config as cfg, names
-from bliss.agents import BUILTIN, agent_command, get_agent
+from bliss.agents import BUILTIN, agent_command, get_agent, read_credentials
 from bliss.util import BlissError
 
 TOML = """
@@ -145,6 +146,32 @@ class WorkloadNameTest(Base):
         self.assertRegex(output, r"\* +sunny-otter +a +running")
         self.assertIn("bare 'bliss attach' here means sunny-otter", output)
 
+    def test_list_json(self):
+        self.add("sunny-otter")
+        out = io.StringIO()
+        with mock.patch.object(cli, "get_target") as target, redirect_stdout(out), \
+                mock.patch.object(Path, "cwd", return_value=Path("/here")):
+            target.return_value.status.return_value = "running"
+            self.assertEqual(cli.main(["list", "--json"]), 0)
+        row = json.loads(out.getvalue())[0]
+        self.assertEqual((row["name"], row["state"], row["here"]), ("sunny-otter", "running", True))
+
+    def test_empty_list_json_is_still_json(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(cli.main(["list", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue()), [])
+
+    def test_targets_json(self):
+        cli.main(["--target", "b"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(cli.main(["targets", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue()),
+                         [{"name": "a", "type": "podman", "default": False},
+                          {"name": "b", "type": "ssh", "default": True},
+                          {"name": "here", "type": "here", "default": False}])
+
     def test_list_survives_an_unreachable_target(self):
         self.add("sunny-otter")
         def fail(record):
@@ -158,6 +185,34 @@ class WorkloadNameTest(Base):
             self.assertEqual(cli.main(["attach", "ott"]), 1)
             target.return_value.attach.assert_not_called()
 
+    def _status_json(self, state):
+        if not cfg.list_workloads():
+            self.add("sunny-otter")
+        out = io.StringIO()
+        with mock.patch.object(cli, "get_target") as target, redirect_stdout(out):
+            target.return_value.status.return_value = state
+            self.assertEqual(cli.main(["status", "--json", "ott"]), 0)
+        return json.loads(out.getvalue())
+
+    def test_status_json(self):
+        self.assertEqual(self._status_json("running"),
+                         {"name": "sunny-otter", "target": "a", "state": "running",
+                          "finished": False, "exit": None})
+
+    def test_status_json_counts_a_kept_shell_as_finished(self):
+        status = self._status_json("exited(3)")
+        self.assertEqual((status["finished"], status["exit"]), (True, 3))
+        status = self._status_json("Succeeded")
+        self.assertEqual((status["finished"], status["exit"]), (True, 0))
+
+    def test_status_without_json_is_unchanged(self):
+        self.add("sunny-otter")
+        out = io.StringIO()
+        with mock.patch.object(cli, "get_target") as target, redirect_stdout(out):
+            target.return_value.status.return_value = "running"
+            self.assertEqual(cli.main(["status", "ott"]), 0)
+        self.assertEqual(out.getvalue(), "sunny-otter: running\n")
+
     def test_short_aliases(self):
         self.add("sunny-otter")
         with mock.patch.object(cli, "get_target") as target:
@@ -166,6 +221,53 @@ class WorkloadNameTest(Base):
             self.assertEqual(cli.main(["a", "ott"]), 0)
             target.return_value.attach.assert_called_once()
             self.assertEqual(cli.main(["ls"]), 0)
+
+
+class HereTest(Base):
+    def test_exists_without_settings(self):
+        self.conf.write_text("")
+        self.assertEqual(cli.main(["--target", "here"]), 0)
+        self.assertEqual(cfg.get_default_target(), "here")
+
+    def test_settings_can_choose_screen(self):
+        self.conf.write_text('[targets.here]\ntype = "here"\nsession = "screen"\n')
+        self.assertEqual(cfg.load_config().target("here")["session"], "screen")
+
+    def test_plan_needs_no_package_manager(self):
+        out = io.StringIO()
+        with mock.patch.object(cli, "detect_system", side_effect=AssertionError), redirect_stdout(out):
+            self.assertEqual(cli.main(["-t", "here", "run", "-n", "--", "x"]), 0)
+        self.assertIn("in place", out.getvalue())
+
+    def test_agent_must_be_installed_and_nothing_is_fetched(self):
+        with mock.patch.object(cli, "resolve", side_effect=AssertionError), \
+                mock.patch.object(cli, "has_tool", return_value=False):
+            self.assertEqual(cli.main(["-t", "here", "ai", "-n", "--agent", "pi", "x"]), 1)
+
+    def test_agent_runs_from_path_without_sending_credentials(self):
+        self.conf.write_text('[agents.claude]\ncredentials = ["/nonexistent"]\n')
+        out = io.StringIO()
+        with mock.patch.object(cli, "resolve", side_effect=AssertionError), \
+                mock.patch.object(cli, "has_tool", return_value=True), redirect_stdout(out):
+            self.assertEqual(cli.main(["-t", "here", "ai", "-n", "x"]), 0)
+        self.assertNotIn("login:", out.getvalue())
+
+    def test_launch_json_prints_the_workload(self):
+        out = io.StringIO()
+        with mock.patch.object(cli, "get_target") as target, \
+                mock.patch.object(cli, "has_tool", return_value=True), redirect_stdout(out):
+            target.return_value.launch.return_value = {"session": "s", "dir": "/d"}
+            self.assertEqual(cli.main(["-t", "here", "ai", "--json", "--", "do it"]), 0)
+        started = json.loads(out.getvalue())
+        self.assertEqual(started["target"], "here")
+        self.assertEqual(cfg.find_workload(None, started["name"], "/")["id"], started["name"])
+
+    def test_pull_says_there_is_nothing_to_copy(self):
+        cfg.record_workload({"id": "sunny-otter", "target": "here", "cwd": "/x", "time": 0,
+                             "session": "s", "dir": "/d"})
+        with mock.patch.object(cli, "get_target") as target:
+            self.assertEqual(cli.main(["pull", "ott"]), 0)
+            target.return_value.pull.assert_not_called()
 
 
 class AgentTest(Base):
@@ -202,6 +304,26 @@ class AgentTest(Base):
     def test_default_from_config(self):
         self.conf.write_text('[ai]\nagent = "hermes"\n')
         self.assertEqual(get_agent(cfg.load_config(), None).name, "hermes")
+
+    def test_credentials_are_opt_in(self):
+        self.assertEqual(get_agent(cfg.load_config(), "claude").credentials, ())
+
+    def test_credentials_are_read_by_their_own_name(self):
+        login = self.dir / ".credentials.json"
+        login.write_text("token")
+        self.conf.write_text(f'[agents.claude]\ncredentials = ["{login}"]\n')
+        agent = get_agent(cfg.load_config(), "claude")
+        self.assertEqual(read_credentials(agent), {".credentials.json": "token"})
+
+    def test_missing_credentials_file_is_an_error_not_a_silent_skip(self):
+        self.conf.write_text('[agents.claude]\ncredentials = ["/nonexistent/login.json"]\n')
+        with self.assertRaisesRegex(BlissError, "cannot read /nonexistent/login.json"):
+            read_credentials(get_agent(cfg.load_config(), "claude"))
+
+    def test_agent_without_a_config_directory_refuses_credentials(self):
+        self.conf.write_text('[agents.hermes]\ncredentials = ["~/x"]\n')
+        with self.assertRaisesRegex(BlissError, "cannot send them safely"):
+            get_agent(cfg.load_config(), "hermes")
 
     def test_unknown_agent(self):
         with self.assertRaises(BlissError):

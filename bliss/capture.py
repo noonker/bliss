@@ -80,6 +80,17 @@ def capture_env(environ: dict[str, str], *, profile: str | None, closure: set[st
     return result
 
 
+# Only what describes the terminal this happens to run in. Everything else
+# stays exactly as it is, because the workload is staying on this machine.
+_NOT_HERE = {"TMUX", "TMUX_PANE", "STY", "WINDOW", "TERM", "TERMCAP", "COLORTERM", "PWD", "OLDPWD",
+             "SHLVL", "_"}
+
+
+def here_env(environ: dict[str, str]) -> dict[str, str]:
+    """The environment for a workload that runs in place."""
+    return {name: value for name, value in environ.items() if name not in _NOT_HERE}
+
+
 def _replace_path(value: str, path: str, mark: str) -> str:
     """Replace `path` only where it ends at a path boundary."""
     return re.sub(re.escape(path) + r"(?=$|[/:])", lambda _: mark, value)

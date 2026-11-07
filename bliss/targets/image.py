@@ -34,10 +34,15 @@ def ensure_system_image(engine: list[str], pack: Pack) -> str:
     if not names:
         raise BlissError(f"could not find the image name in load output: {loaded}")
     run([*engine, "tag", names[-1], tag], quiet=True)
-    if names[-1] != tag:
+    if _short_name(names[-1]) != tag:
         # Guix names the image itself; only the content-addressed tag is ours to find.
         run([*engine, "rmi", names[-1]], check=False, quiet=True)
     return tag
+
+
+def _short_name(image: str) -> str:
+    """An engine may report `bliss-sys:x` as `localhost/bliss-sys:x`: the same image."""
+    return image.removeprefix("localhost/").removeprefix("docker.io/library/")
 
 
 def _layers(engine: list[str], image: str) -> list[str]:

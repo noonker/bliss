@@ -3,21 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__, config as cfg
-from .agents import agent_command, get_agent, resolve
-from .capture import capture_env
+from .agents import Release, agent_command, get_agent, read_credentials, resolve
+from .capture import capture_env, here_env
 from .names import new_name
 from .system import AgentSpec, detect_system
 from .targets import get_target
 from .targets.base import Workload
-from .util import BlissError, log
+from .util import BlissError, has_tool, log
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = actions.add_parser("run", help="run a command on the target (default: a shell)")
     run.add_argument("--attach", "-a", action="store_true", help="attach after starting")
     run.add_argument("--dry-run", "-n", action="store_true", help="show the plan; send nothing")
+    run.add_argument("--json", action="store_true",
+                     help="print the started workload as JSON, for other tools")
     run.add_argument("command", nargs=argparse.REMAINDER, help="command (after --)")
 
     ai = actions.add_parser("ai", help="run an AI agent on the target")
@@ -39,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     ai.add_argument("--attach", "-a", action="store_true", help="attach after starting")
     ai.add_argument("--dry-run", "-n", action="store_true", help="show the plan; send nothing")
     ai.add_argument("--refresh", action="store_true", help="check for a new agent release now")
+    ai.add_argument("--json", action="store_true",
+                    help="print the started workload as JSON, for other tools")
     ai.add_argument("--unattended", action="store_true", default=None,
                     help="let the agent act without approval prompts")
     ai.add_argument("prompt", nargs="*", help="task; omit for an interactive session")
@@ -50,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 ("stop", "stop a workload and remove it from the target", [])):
         sub = actions.add_parser(name, help=text, aliases=aliases)
         sub.add_argument("id", nargs="?", metavar="name", help=which)
+        if name == "status":
+            sub.add_argument("--json", action="store_true", help="print JSON, for other tools")
     logs = actions.add_parser("logs", help="show a workload's output")
     logs.add_argument("id", nargs="?", metavar="name", help=which)
     logs.add_argument("--follow", "-f", action="store_true")
@@ -58,8 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--dest", help="directory to write (default: .bliss/pull/<id>)")
     gc = actions.add_parser("gc", help="remove cached systems and agents no workload uses")
     gc.add_argument("--dry-run", "-n", action="store_true", help="show what would go; remove nothing")
-    actions.add_parser("list", aliases=["ls"], help="list workloads and their state")
-    actions.add_parser("targets", help="list configured targets")
+    listing = actions.add_parser("list", aliases=["ls"], help="list workloads and their state")
+    listing.add_argument("--json", action="store_true", help="print JSON, for other tools")
+    targets = actions.add_parser("targets", help="list configured targets")
+    targets.add_argument("--json", action="store_true", help="print JSON, for other tools")
     return parser
 
 
@@ -70,6 +80,10 @@ def _target_name(args, config: cfg.Config) -> str:
                          "use --target <name> (see 'bliss targets')")
     config.target(name)
     return name
+
+
+def _is_in_place(target_spec: dict) -> bool:
+    return target_spec["type"] == "here"
 
 
 def _print_targets(config: cfg.Config) -> None:
@@ -83,12 +97,14 @@ def _print_targets(config: cfg.Config) -> None:
 
 def _print_plan(target: str, spec: dict, system, workload: Workload) -> None:
     print(f"target:  {target} ({spec['type']})")
-    print(f"system:  {system.describe()}")
-    print(f"files:   {workload.root} (see .blissignore)")
+    print(f"system:  {system.describe() if system else 'this machine, as it is'}")
+    print(f"files:   {workload.root} " + ("(see .blissignore)" if system else "(in place; nothing is copied)"))
     print(f"command: {workload.command}")
     if workload.spec:
         release = workload.spec.release
         print(f"agent:   {workload.spec.agent.name} {release.version} ({workload.spec.agent.kind})")
+        for path in workload.spec.agent.credentials if system else ():
+            print(f"login:   {path} (copied to the target; see [agents] credentials)")
     print(f"env ({len(workload.env)} vars, values not shown):")
     for name in sorted(workload.env):
         print(f"  {name}")
@@ -97,24 +113,36 @@ def _print_plan(target: str, spec: dict, system, workload: Workload) -> None:
 def _launch(args, config: cfg.Config, command: list[str], spec: AgentSpec | None,
             attach: bool, unattended: bool = False) -> int:
     name = _target_name(args, config)
-    if spec and platform.machine() != "x86_64":
-        raise BlissError(f"AI agents are only packed for x86_64, not {platform.machine()}")
     target_spec = config.target(name)
     target = get_target(name, target_spec)
+    in_place = _is_in_place(target_spec)
+    if spec and not in_place and platform.machine() != "x86_64":
+        raise BlissError(f"AI agents are only packed for x86_64, not {platform.machine()}")
     root = Path.cwd()
-    system = detect_system(dict(os.environ))
-    env = capture_env(dict(os.environ), profile=system.profile(), closure=system.closure(),
-                      cwd=str(root), settings=config.env)
+    if in_place:
+        system = None
+        env = here_env(dict(os.environ))
+    else:
+        system = detect_system(dict(os.environ))
+        env = capture_env(dict(os.environ), profile=system.profile(), closure=system.closure(),
+                          cwd=str(root), settings=config.env)
     workload = Workload(id=new_name({w["id"] for w in cfg.list_workloads()}), root=root, command=command, env=env, spec=spec,
-                        unattended=unattended)
+                        unattended=unattended,
+                        # Here, the agent already has the login that is on this machine.
+                        credentials=read_credentials(spec.agent) if spec and not in_place else {})
     if args.dry_run:
         _print_plan(name, target_spec, system, workload)
         return 0
+    if workload.credentials:
+        log(f"sending your {spec.agent.name} login to {name}: "
+            + ", ".join(sorted(workload.credentials)))
     details = target.launch(system, workload)
     record = {"id": workload.id, "target": name, "cwd": str(root), "time": time.time(),
               "command": command, **details}
     cfg.record_workload(record)
     log(f"started {workload.id} on {name}")
+    if getattr(args, "json", False):
+        print(json.dumps({"name": workload.id, "target": name}), flush=True)
     if attach:
         return target.attach(record)
     log(f"attach: bliss attach {workload.id}   logs: bliss logs {workload.id}   "
@@ -137,12 +165,30 @@ def _cmd_ai(args, config: cfg.Config) -> int:
     command = agent_command(agent, prompt, unattended)
     if unattended and command[0] != agent.name:
         log(f"warning: this {agent.name} command is a wrapper, so its unattended flags were not added")
-    spec = AgentSpec(agent, resolve(agent, refresh=args.refresh))
+    if _is_in_place(config.target(_target_name(args, config))):
+        # Whatever is on PATH is what runs, so there is nothing to fetch or pin.
+        if not has_tool(agent.name):
+            raise BlissError(f"{agent.name} is not installed on this machine; the 'here' target "
+                             "runs what is on your PATH and does not download agents")
+        if unattended:
+            log(f"warning: {agent.name} will act without approval prompts directly on this "
+                "machine, with nothing sandboxing it")
+        spec = AgentSpec(agent, Release("installed", "", ""))
+    else:
+        spec = AgentSpec(agent, resolve(agent, refresh=args.refresh))
     return _launch(args, config, command, spec, args.attach or not prompt, unattended)
 
 
 # States with no process left. An ssh workload that "exited(N)" keeps its shell.
 _FINISHED = {"gone", "exited", "stopped", "Succeeded", "Failed"}
+
+
+def _status_json(record: dict, state: str) -> dict:
+    """`finished` is whether the command has ended, even if a shell is kept open after it."""
+    match = re.fullmatch(r"exited\((-?\d+)\)", state)
+    exit_code = int(match.group(1)) if match else {"Succeeded": 0}.get(state)
+    return {"name": record["id"], "target": record["target"], "state": state,
+            "finished": state in _FINISHED or match is not None, "exit": exit_code}
 
 
 def _manage(args, config: cfg.Config) -> int:
@@ -158,7 +204,14 @@ def _manage(args, config: cfg.Config) -> int:
     if args.action == "logs":
         return target.logs(record, args.follow)
     if args.action == "status":
-        print(f"{record['id']}: {target.status(record)}")
+        state = target.status(record)
+        if args.json:
+            print(json.dumps(_status_json(record, state)))
+        else:
+            print(f"{record['id']}: {state}")
+        return 0
+    if args.action == "pull" and _is_in_place(config.target(record["target"])):
+        log(f"{record['id']} works in {record['cwd']}; there is nothing to copy")
         return 0
     if args.action == "pull":
         dest = Path(args.dest) if args.dest else Path.cwd() / ".bliss" / "pull" / record["id"]
@@ -186,14 +239,26 @@ def _state(record: dict, config: cfg.Config) -> str:
         return "unknown"
 
 
-def _cmd_list(config: cfg.Config) -> int:
+def _record_in_place(record: dict, config: cfg.Config) -> bool:
+    spec = config.targets.get(record["target"])
+    return bool(spec) and _is_in_place(spec)
+
+
+def _cmd_list(args, config: cfg.Config) -> int:
     records = cfg.list_workloads()
-    if not records:
+    if not records and not args.json:
         print("no workloads; start one with 'bliss run' or 'bliss ai'")
         return 0
     with ThreadPoolExecutor(max_workers=8) as pool:
         states = list(pool.map(lambda r: _state(r, config), records))
     here = cfg.newest_here(records, str(Path.cwd()))
+    if args.json:
+        print(json.dumps([{"name": record["id"], "target": record["target"], "state": state,
+                           "started": record["time"], "directory": record["cwd"],
+                           "command": record.get("command", []), "here": record is here,
+                           "in_place": _record_in_place(record, config)}
+                          for record, state in zip(records, states)]))
+        return 0
     rows = [("", "NAME", "TARGET", "STATE", "AGE", "DIRECTORY")]
     for record, state in zip(records, states):
         directory = record["cwd"].replace(os.path.expanduser("~"), "~", 1)
@@ -227,10 +292,15 @@ def dispatch(argv: list[str]) -> int:
         _print_targets(config)
         return 0
     if args.action == "targets":
+        if args.json:
+            default = cfg.get_default_target()
+            print(json.dumps([{"name": name, "type": spec["type"], "default": name == default}
+                              for name, spec in sorted(config.targets.items())]))
+            return 0
         _print_targets(config)
         return 0
     if args.action == "list":
-        return _cmd_list(config)
+        return _cmd_list(args, config)
     if args.action == "gc":
         return _cmd_gc(args, config)
     if args.action == "run":
